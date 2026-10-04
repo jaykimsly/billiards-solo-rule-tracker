@@ -1,0 +1,47 @@
+import { useCallback, useMemo, useRef, useState } from 'react';
+import { GameMode, SCORING, ShotLogEntry, ShotOutcome, SOLO_LEVELS, SoloLevel } from '@/types/game';
+
+export interface PlayerState { name: string; racksWon: number; fouls: number; }
+export type RackStatus = 'playing' | 'won' | 'lost';
+export interface GameState {
+  mode: GameMode; level: SoloLevel; rackNumber: number; remaining: number[]; lives: number; score: number;
+  players: [PlayerState, PlayerState]; currentPlayer: 0 | 1; ballInHand: boolean; status: RackStatus; winner: 0 | 1 | null; lastEvent: string | null;
+}
+const initialPlayers = (): [PlayerState, PlayerState] => [
+  { name: 'Player 1', racksWon: 0, fouls: 0 }, { name: 'Player 2', racksWon: 0, fouls: 0 },
+];
+export function createGame(mode: GameMode, level: SoloLevel, prev?: GameState): GameState {
+  const cfg = SOLO_LEVELS.find((l) => l.level === level)!;
+  return {
+    mode, level, rackNumber: (prev?.rackNumber ?? 0) + 1, remaining: [1,2,3,4,5,6,7,8,9],
+    lives: cfg.lives, score: 0, players: prev?.players ?? initialPlayers(),
+    currentPlayer: prev ? (prev.currentPlayer === 0 ? 1 : 0) : 0,
+    ballInHand: false, status: 'playing', winner: null, lastEvent: null,
+  };
+}
+export function useGame() {
+  const [game, setGame] = useState<GameState | null>(null);
+  const [log, setLog] = useState<ShotLogEntry[]>([]);
+  const undoStack = useRef<{game:GameState;log:ShotLogEntry[]}[]>([]);
+  const logId = useRef(0);
+  const target = useMemo(() => game && game.remaining.length ? Math.min(...game.remaining) : null, [game]);
+  const pushUndo = useCallback((g:GameState,l:ShotLogEntry[]) => { undoStack.current.push({game:structuredClone(g),log:[...l]}); if(undoStack.current.length>60) undoStack.current.shift(); }, []);
+  const startGame = useCallback((mode:GameMode,level:SoloLevel) => { undoStack.current=[]; setLog([]); setGame(createGame(mode,level)); }, []);
+  const nextRack = useCallback(() => { setGame(g => { if(!g)return g; pushUndo(g,log); return createGame(g.mode,g.level,g); }); }, [log,pushUndo]);
+  const undo = useCallback(() => { const prev=undoStack.current.pop(); if(prev){setGame(prev.game);setLog(prev.log);} }, []);
+  const addLog = useCallback((entry:Omit<ShotLogEntry,'id'>) => setLog(l=>[{...entry,id:++logId.current},...l].slice(0,50)), []);
+  const recordShot = useCallback((outcome:ShotOutcome,potted:number[]=[]) => {
+    setGame(g => {
+      if(!g || g.status!=='playing') return g;
+      pushUndo(g,log);
+      const next=structuredClone(g), who=next.currentPlayer, tgt=Math.min(...next.remaining), solo=next.mode==='solo';
+      const loseLife=(n:number)=>{next.lives=Math.max(0,next.lives-n);if(next.lives===0)next.status='lost';};
+      if(outcome==='pot'){ next.remaining=next.remaining.filter(b=>!potted.includes(b)); if(solo){const hasNine=potted.includes(9);const delta=potted.reduce((s,b)=>s+(b===9?SCORING.NINE:SCORING.BALL),0);next.score+=delta;next.lastEvent=`Pocketed ${potted.join(', ')} — keep shooting.`;addLog({outcome,ball:potted[0]??null,player:who,label:`Potted ${potted.join(' + ')} (legal)`,delta});if(hasNine){next.status='won';next.winner=0;next.lastEvent='The 9 is down — rack won!';}} else {next.currentPlayer=who;next.lastEvent=`${next.players[who].name} pockets and keeps the table.`;addLog({outcome,ball:potted[0]??null,player:who,label:`${next.players[who].name}: potted ${potted.join(' + ')}`,delta:null});if(potted.includes(9)){next.status='won';next.winner=who;next.players[who].racksWon+=1;}}return next;}
+      if(outcome==='miss'){if(solo){next.score+=SCORING.MISS;loseLife(1);next.lastEvent=next.status==='lost'?'No lives left — rack over.':`Miss on the ${tgt}. −1 life.`;addLog({outcome,ball:tgt,player:who,label:`Miss on the ${tgt}`,delta:SCORING.MISS});}else{next.currentPlayer=who===0?1:0;next.lastEvent=`Miss on the ${tgt}. Turn passes.`;addLog({outcome,ball:tgt,player:who,label:`${next.players[who].name}: miss on the ${tgt}`,delta:null});}next.ballInHand=false;return next;}
+      if(outcome==='foul'){if(solo){next.score+=SCORING.FOUL;loseLife(1);next.ballInHand=next.level<=1;next.lastEvent=next.status==='lost'?'No lives left — rack over.':`Foul — ${tgt} was on. −1 life.`;addLog({outcome,ball:tgt,player:who,label:`Foul — wrong ball (${tgt} was on)`,delta:SCORING.FOUL});}else{next.players[who].fouls+=1;next.currentPlayer=who===0?1:0;next.ballInHand=true;next.lastEvent=`Foul — ${next.players[who].name}. Ball-in-hand.`;addLog({outcome,ball:tgt,player:who,label:`${next.players[who].name}: foul — wrong ball`,delta:null});}return next;}
+      if(outcome==='scratch'){if(solo){next.score+=SCORING.SCRATCH;if(next.level>=2)loseLife(1);next.ballInHand=next.level<=1;next.lastEvent=next.status==='lost'?'Scratch — rack over.':next.level<=1?'Scratch. Ball-in-hand anywhere.':'Scratch. −1 life.';addLog({outcome,ball:null,player:who,label:'Scratch',delta:SCORING.SCRATCH});}else{next.players[who].fouls+=1;next.currentPlayer=who===0?1:0;next.ballInHand=true;next.lastEvent=`${next.players[who].name} scratched. Ball-in-hand.`;addLog({outcome,ball:null,player:who,label:`${next.players[who].name}: scratch`,delta:null});}return next;}
+      return next;
+    });
+  }, [addLog,log,pushUndo]);
+  return {game,log,target,startGame,nextRack,undo,recordShot,canUndo:undoStack.current.length>0,setGame};
+}
